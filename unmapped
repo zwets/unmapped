@@ -1,0 +1,213 @@
+#!/bin/sh
+#
+#  unmapped - extract read pairs that do not map on a reference
+#  Copyright (C) 2017  Marco van Zwetselaar <io@zwets.it>
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#  Homed at https://github.com/zwets/unmapped
+
+# Defaults
+
+BASENAME="./unmapped"
+FQEXT="fastq.gz"
+WORK_DIR="/tmp/$(basename "$0").$$"
+
+# Prepare for cleanup when aborting
+
+set -e
+trap cleanup EXIT
+RETVAL=1
+
+# Function to emit information to standard error if VERBOSE is set
+emit() {
+    [ -z "$VERBOSE" ] || echo "$(basename "$0"): $*" >&2 || true
+}
+
+# Function to exit this script with an error message on stderr
+err_exit() {
+    echo "$(basename "$0"): $*" >&2
+    exit 1
+}
+
+# Function to cleanup at exit, trapped on EXIT
+cleanup() {
+    [ ! -d "$WORK_DIR" ] || {
+        emit "clean up, remove $WORK_DIR"
+        rm -rf "$WORK_DIR"
+        }
+    exit $RETVAL
+}
+
+# Function either unxz-s file $1 to $2 or links to original
+# Note that 
+unzip_or_link() {
+    local FT="$(file --mime-type "$1")"
+    if [ "$FT" = "$1: application/x-xz" ]; then
+        emit "unxzipping $1"
+        xz -dc "$1" >"$2"
+    else
+        emit "linking $1"
+        ln -sf "$1" "$2"
+    fi
+}
+
+# Function to check that file $1 is either absent or writable by force
+check_outfile() {
+    [ -n "$FORCE" ] || [ ! -e "$1" ] || err_exit "file exists (--force to overwrite): $1"
+    [ ! -e "$1" ] || [ -f "$1" ] || err_exit "path exists and is not a file: $1"
+    [ -w "$(dirname "$1")" ] || [ -w "$1" ] || err_exit "not writeable: $1"
+}
+
+# Function to show usage information and exit
+usage_exit() {
+    echo "
+Usage: $(basename $0) [OPTIONS] REFERENCE READS1 READS2
+       $(basename $0) [OPTIONS] BAMFILE
+
+  Extract paired-end reads that do not map on a reference.
+ 
+  This script can be invoked either with a REFERENCE and two paired-end READS
+  files, or with an existing BAMFILE containing a paired-end read mapping.
+  It produces files {NAME}_R1.${FQEXT} and {NAME}_R2.${FQEXT} containing the
+  unmapped read pairs.
+
+  OPTIONS
+   -b, --base NAME  Base (path and) name for output files (default $BASENAME)
+   -s, --semi       Include semi-mapped reads (with one mapping mate)
+   -k, --keep       Keep the generated (unfiltered) BAM file as {NAME}.bam
+   -f, --force      Overwrite existing output files
+   -v, --verbose    Emit progress messages to standard error
+
+  The REFERENCE must be in FASTA format, the READS in FASTQ format.  Any of
+  these may compressed with xz or gzip.  Use option -k to keep the BAM file
+  with the (mapped and unmapped) reads for later use.
+"
+    exit ${1:-1}
+}
+
+# Parse options
+
+unset KEEP SEMI FORCE VERBOSE
+while [ $# -ne 0 -a "$(expr "$1" : '\(.[0-9]*\).*')" = "-" ]; do
+    case $1 in
+    --base=*)
+        BASENAME="${1#--base=}"
+        ;;
+    -b|--base)
+        shift
+        BASENAME="$1"
+        ;;
+    -s|--semi)
+        SEMI=1
+        ;;
+    -k|--keep)
+        KEEP=1
+        ;;
+    -f|--force)
+        FORCE=1
+        ;;
+    -v|--verbose)
+        VERBOSE=1
+        ;;
+    -h|--help)
+        usage_exit 0
+        ;;
+    *) usage_exit
+        ;;
+    esac
+    shift
+done
+
+# Check the arguments
+
+if [ $# -eq 1 ]; then
+    ORIG_BAM_FILE="$(realpath -e "$1" || err_exit "file not found: $1")"
+    [ -z "$KEEP" ] || emit "ignoring -k option as you have the original BAM file"
+    unset KEEP
+    shift 1
+elif [ $# -eq 3 ]; then
+    TARGET_FILE="$(realpath -e "$1" || err_exit "file not found: $1")"
+    READS1_FILE="$(realpath -e "$2" || err_exit "file not found: $2")"
+    READS2_FILE="$(realpath -e "$3" || err_exit "file not found: $3")"
+    shift 3
+else
+    usage_exit
+fi
+
+# Check availability of the tools
+
+emit "checking for required tools"
+for P in bwa samtools bedtools; do
+    which "$P" > /dev/null || err_exit "required program not present: $P"
+done
+
+# Generate output names
+
+OUTFILE_R1="$(realpath "${BASENAME}_R1.${FQEXT}")"
+OUTFILE_R2="$(realpath "${BASENAME}_R2.${FQEXT}")"
+[ -z "$KEEP" ] || OUTFILE_BAM="$(realpath "${BASENAME}.bam")"
+
+check_outfile "$OUTFILE_R1"
+check_outfile "$OUTFILE_R2"
+[ -z "$OUTFILE_BAM" ] || check_outfile "$OUTFILE_BAM"
+
+# Make and change to WORK_DIR
+
+emit "creating working directory: $WORK_DIR"
+mkdir -p "$WORK_DIR"
+cd "$WORK_DIR"
+
+# Perform the (optional) mapping
+
+# Option -f means include when all flags are set, -F means skip when any bit set
+# - Bit 0x02: My mate and I are a mapped pair
+# - Bit 0x04: I am unmapped" (dunno about mate)
+# - Bit 0x08: Mate is unmapped" (dunno about me)
+# So strict is -f 12 (include where both in pair are unmapped)
+# And lax is -F 4 -f 8 (include those exclude those that where both are mapped)
+FILTER_FLAG="-f 12"
+[ -z "$SEMI" ] || FILTER_FLAG="-F 2"
+
+if [ -n "$ORIG_BAM_FILE" ]; then
+    samtools view -b $FILTER_FLAG "$ORIG_BAM_FILE" > 'filtered.bam'
+else
+    unzip_or_link "$TARGET_FILE" 'target.fa'
+    unzip_or_link "$READS1_FILE" 'reads1.fq'
+    unzip_or_link "$READS2_FILE" 'reads2.fq'
+
+    emit "bwa indexing the target file"
+    bwa index 'target.fa'
+
+    emit "mapping reads on target"
+    bwa mem -R "@RG\tID:FLOWCELL1.LANE1\tPL:ILLUMINA\tLB:unmapped\tSM:sample" -t $(nproc) 'target.fa' 'reads1.fq' 'reads2.fq' | 
+    samtools view -bS - | tee "${OUTFILE_BAM:-/dev/null}" | samtools view -b $FILTER_FLAG - > 'filtered.bam'
+fi
+
+# Extract FASTQ from BAM
+
+emit "extracting FASTQ from BAM"
+bedtools bamtofastq -i 'filtered.bam' -fq 'unmapped1.fq' -fq2 'unmapped2.fq' 2>/dev/null
+
+# Produce final files
+
+emit "writing $OUTFILE_R1"
+gzip -c 'unmapped1.fq' > "$OUTFILE_R1"
+
+emit "writing $OUTFILE_R2"
+gzip -c 'unmapped2.fq' > "$OUTFILE_R2"
+
+RETVAL=0
+
+# vim: sts=4:sw=4:ai:si:et:
