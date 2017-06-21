@@ -100,7 +100,7 @@ Usage: $(basename $0) [OPTIONS] REFERENCE READS1 READS2
 # Parse options
 
 unset KEEP SEMI FORCE VERBOSE
-while [ $# -ne 0 -a "$(expr "$1" : '\(.[0-9]*\).*')" = "-" ]; do
+while [ $# -ne 0 -a "$(expr "$1" : '\(.\)..*')" = "-" ]; do
     case $1 in
     --base=*)
         BASENAME="${1#--base=}"
