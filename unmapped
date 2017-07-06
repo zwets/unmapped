@@ -53,8 +53,8 @@ cleanup() {
 # Function either unxz-s file $1 to $2 or links to original
 # Note that 
 unzip_or_link() {
-    local FT="$(file --mime-type "$1")"
-    if [ "$FT" = "$1: application/x-xz" ]; then
+    local FT="$(file --mime-type --brief "$1")"
+    if [ "$FT" = "application/x-xz" ]; then
         emit "unxzipping $1"
         xz -dc "$1" >"$2"
     else
